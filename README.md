@@ -3,8 +3,6 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/JosephusZhou/CFWorkerAITranslate/actions/workflows/ci.yml/badge.svg)](https://github.com/JosephusZhou/CFWorkerAITranslate/actions/workflows/ci.yml)
 
-> CI 徽章显示 `main` 分支最近一次 push / pull_request 的构建状态；首次推送后才会出现结果。
-
 用 **Cloudflare Workers AI** 免费额度提供 DeepLX / DeepL 兼容的翻译接口。默认模型 `@cf/qwen/qwen3-30b-a3b-fp8`，单文件实现、无第三方运行时依赖。
 
 适合这些场景：
