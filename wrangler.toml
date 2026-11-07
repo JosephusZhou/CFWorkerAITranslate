@@ -1,0 +1,46 @@
+# 部署入口：`wrangler dev` / `wrangler deploy` 均读取此文件。
+# 代码里读取的 binding 名称：env.AI、env.CACHE；变量名见 src/index.js 的 readConfig()。
+name = "ai-deeplx"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+# 免费 workers.dev 子域名；部署后会得到 https://ai-deeplx.<subdomain>.workers.dev
+workers_dev = true
+
+# Workers AI binding —— 名称必须与代码里的 env.AI 一致，不要改名。
+# 账号侧：Workers AI 默认已启用（免费计划含每日 10,000 Neurons）。
+# 首次使用 Llama 系模型需在 Cloudflare Dashboard 的 Workers AI 页面同意模型条款，否则会返回 403/5016。
+# 本地 `wrangler dev` 也会把推理请求发到远端 Workers AI，需先 `wrangler login`，并会消耗配额。
+[ai]
+binding = "AI"
+# Workers AI 没有本地模拟，显式声明走远端；本地 dev 与线上行为一致，也避免 wrangler 的告警。
+remote = true
+
+[vars]
+# 默认模型：Qwen3-30B-A3B（免费额度内，多语言较强）
+MODEL = "@cf/qwen/qwen3-30b-a3b-fp8"
+
+# 单次请求（单条或批量合计）允许的最大 UTF-16 字符数，对齐 DLX 的 1500
+MAX_TOTAL_CHARS = "1500"
+# 批量时最多允许的文本段数
+MAX_ITEMS = "30"
+# 单段超过该长度时先切分再逐段翻译（需小于 MAX_TOTAL_CHARS 才有意义）
+SEGMENT_CHARS = "1000"
+# 显式输出上限，避免 Llama/Granite 默认 256 截断长文
+MAX_OUTPUT_TOKENS = "4096"
+TEMPERATURE = "0.1"
+# 批量翻译时同时发起的 AI 调用数
+CONCURRENCY = "2"
+# KV 缓存 TTL（秒）；未绑定 CACHE 时缓存与配额熔断自动跳过
+CACHE_TTL = "86400"
+
+# 敏感值不要写进本文件：
+# - TOKEN 用 `npx wrangler secret put TOKEN` 写入（本地可用 .dev.vars 临时覆盖）
+# - 不设置 TOKEN 则接口无鉴权，公网部署前务必配置
+
+# 可选：启用 KV 做精确缓存 + 配额熔断标记。
+# 账号侧需先创建资源：`npx wrangler kv namespace create CACHE`，
+# 再把返回的 id 填入下面并取消注释。
+# [[kv_namespaces]]
+# binding = "CACHE"
+# id = "<your-kv-namespace-id>"
