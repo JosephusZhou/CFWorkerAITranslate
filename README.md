@@ -40,8 +40,8 @@
 ### 1. 获取代码
 
 ```bash
-git clone https://github.com/JosephusZhou/CFWorkerAITranslate.git AITranslate
-cd AITranslate
+git clone https://github.com/JosephusZhou/CFWorkerAITranslate.git
+cd CFWorkerAITranslate
 ```
 
 也可以直接在仓库页面下载 ZIP 解压后进入目录。
