@@ -16,10 +16,11 @@
 ```text
 .
 ├── src/index.js                          # Worker 实现（唯一运行时代码）
+├── scripts/deploy.mjs                    # 交互式部署脚本（登录/命名/Token/域名/自测）
 ├── test/worker.test.js                   # Node 内置 test runner 测试
 ├── .github/workflows/ci.yml              # GitHub Actions CI
 ├── wrangler.toml                         # AI binding、变量、可选 KV
-├── package.json                          # dev / deploy / check / test 脚本
+├── package.json                          # dev / deploy / deploy:interactive / check / test 脚本
 ├── README.md
 ├── AGENTS.md                             # 给后续维护者/AI 的约定与约束
 └── LICENSE                               # MIT
@@ -32,6 +33,31 @@
 - 账号已启用 **Workers AI**（免费计划默认开启，每日 10,000 Neurons，UTC 00:00 / 北京时间 08:00 重置）。
 - 免费额度用尽后接口返回 `429`，不会自动转付费；Free 计划另有 100,000 请求/天限制。
 - 能正常访问 Cloudflare API 的网络环境。
+
+## 交互式部署（可选）
+
+不想手动逐步执行时，直接在项目根目录运行：
+
+```bash
+npm install
+npm run deploy:interactive
+```
+
+脚本会依次完成：
+
+1. 检查 Node 版本与项目文件，缺少本地依赖时询问是否执行 `npm install`；
+2. 检查 `wrangler` 登录状态，未登录时自动调起 `wrangler login`；
+3. 询问是否自定义 Worker 名称，并写入 `wrangler.toml` 的 `name`；
+4. 询问 TOKEN 方式：自动生成 48 位随机串、手动输入或暂不设置；
+5. 询问是否绑定自定义域名；
+6. 执行 `wrangler deploy`，写入 `TOKEN` secret，并请求线上接口自测（含 401 校验）。
+
+说明：
+
+- 自定义域名必须已托管在**同一个 Cloudflare 账号**且 Zone 状态为 Active；该主机名不能已有冲突的 A/AAAA/CNAME 记录；
+- 名称与域名改动都会写回 `wrangler.toml`：名称改顶部的 `name`，域名写在带脚本注释标记的 `routes` 段内；
+- 脚本不包含本地开发（`npm run dev`），也不会把 TOKEN 写入任何文件，部署结束时会再次显示，请自行保存；
+- 脚本仅使用 Node.js 内置模块，不新增运行时依赖。
 
 ## 从零开始：本地运行与部署
 
@@ -245,7 +271,8 @@ curl -s https://<你的域名>/v2/translate \
 |---|---|
 | `npm run dev` | 本地开发服务器（默认 8787） |
 | `npm run deploy` | 部署到 Cloudflare |
-| `npm run check` | 语法自检（`node --check src/index.js`） |
+| `npm run deploy:interactive` | 交互式部署：登录、命名、Token、可选域名、部署与自测 |
+| `npm run check` | 语法自检（`src/index.js` 与 `scripts/deploy.mjs`） |
 | `npm test` | 运行 Node 内置测试（stub AI，不访问 Cloudflare、不消耗配额） |
 
 ## 测试

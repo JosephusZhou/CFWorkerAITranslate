@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "check": "node --check src/index.js",
+    "deploy:interactive": "node scripts/deploy.mjs",
+    "check": "node --check src/index.js && node --check scripts/deploy.mjs",
     "test": "node --test"
   },
   "devDependencies": {

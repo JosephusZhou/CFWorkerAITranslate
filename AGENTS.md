@@ -15,10 +15,11 @@
 
 ```text
 src/index.js       唯一运行时代码。路由、鉴权、请求体解析、翻译流程、错误映射全在这里。
+scripts/deploy.mjs 交互式部署脚本：登录检查、Worker 命名、Token、可选自定义域名、部署与线上自测；仅用 Node 内置模块。
 test/worker.test.js Node 内置 test runner 测试；`env.AI` 使用 stub，不访问 Cloudflare。
 .github/workflows/ci.yml  GitHub Actions：push / pull_request 时跑 check + test。
 wrangler.toml      部署配置。AI binding、可调变量、可选 KV；不放任何密钥。
-package.json       仅开发期脚本：dev / deploy / check / test；无运行时依赖。
+package.json       仅开发期脚本：dev / deploy / deploy:interactive / check / test；无运行时依赖。
 README.md          面向第一次接触仓库的使用文档（接口、部署、变量、限制）。
 AGENTS.md          本文件：维护约定与技术约束。
 LICENSE            MIT 许可证（Copyright (c) 2026 AITranslate contributors）。
