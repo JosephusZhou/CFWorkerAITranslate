@@ -2,7 +2,7 @@
 /**
  * 交互式部署脚本：按 README 的部署流程逐步引导，直到线上接口自测通过。
  *
- * 流程：环境检查 → 登录检查/调起 → Worker 名称 → 访问 Token → 可选自定义域名 → 部署 → 写入 secret → 线上自测
+ * 流程：环境检查 → 登录检查/调起 → Worker 名称 → 访问 Token → 可选自定义域名 → 部署（注入 git SHA 作为构建标识） → 写入 secret → 线上自测
  *
  * 不包含本地开发（npm run dev）。仅使用 Node 内置模块，不引入第三方依赖。
  */
@@ -10,7 +10,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 
@@ -499,9 +499,36 @@ async function chooseDomain() {
   }
 }
 
+/**
+ * 取当前构建标识：git short SHA；工作区有未提交改动时追加 -dirty，
+ * 免得线上跑的代码和 SHA 指向的 commit 对不上却看不出来。
+ * 取不到（没装 git、不是仓库、无提交）时返回空串，部署照常进行。
+ * 用 spawnSync + 参数数组，不经过 shell。
+ */
+function currentBuildId() {
+  const git = (args) => {
+    const r = spawnSync('git', args, { cwd: ROOT, encoding: 'utf8' });
+    return r.status === 0 ? r.stdout.trim() : null;
+  };
+
+  const sha = git(['rev-parse', '--short', 'HEAD']);
+  if (!sha) return '';
+
+  const dirty = git(['status', '--porcelain']);
+  if (dirty === null) return '';
+
+  return dirty ? `${sha}-dirty` : sha;
+}
+
 async function deployWorker() {
-  console.log('  执行 wrangler deploy（首次部署会自动创建 Worker）...');
-  const result = await runWrangler(['deploy']);
+  const build = currentBuildId();
+  const args = build ? ['deploy', '--var', `BUILD:${build}`] : ['deploy'];
+  console.log(
+    build
+      ? `  执行 wrangler deploy（构建标识 ${build}；首次部署会自动创建 Worker）...`
+      : '  执行 wrangler deploy（未取到 git SHA，跳过构建标识；首次部署会自动创建 Worker）...',
+  );
+  const result = await runWrangler(args);
 
   if (!result.ok) {
     fail('部署失败，常见原因：');
@@ -513,7 +540,7 @@ async function deployWorker() {
   }
 
   ok('wrangler deploy 成功');
-  return result.output;
+  return { output: result.output, build };
 }
 
 function extractWorkersDevUrl(output) {
@@ -546,7 +573,8 @@ async function requestTranslate(baseUrl, token) {
     method: 'POST',
     headers,
     body: JSON.stringify({ text: 'Hello, world!', target_lang: 'ZH' }),
-    signal: AbortSignal.timeout(20000),
+    // 一次请求可能走「主模型重试 + 兜底模型」，比单模型慢，超时留足余量免得误判失败。
+    signal: AbortSignal.timeout(45000),
   });
   const text = await response.text();
   return { status: response.status, text };
@@ -618,9 +646,12 @@ async function verifyAuth(baseUrl) {
   return false;
 }
 
-function printSummary({ name, baseUrl, token, domain }) {
+function printSummary({ name, baseUrl, token, domain, build }) {
   console.log(`\n${green(bold('部署完成'))}`);
   console.log(`  Worker 名称：${name}`);
+  console.log(
+    `  构建标识：${build || '未注入（这台机器没装 git，或你用的是仓库页面下载的 ZIP 压缩包解压出的目录，都属正常）'}`,
+  );
   console.log(`  接口地址：${baseUrl ? `${baseUrl}/translate` : '未解析到，请从上方 wrangler 输出中复制'}`);
   console.log(`  访问 Token：${token || '未设置（接口公开）'}`);
   if (domain) console.log(`  自定义域名：${domain}（已写入 wrangler.toml）`);
@@ -666,7 +697,7 @@ async function main() {
   const domain = await chooseDomain();
 
   step(6, '部署到 Cloudflare');
-  const deployOutput = await deployWorker();
+  const { output: deployOutput, build } = await deployWorker();
 
   step(7, '写入 secret 并线上自测');
   if (token) await putTokenSecret(token);
@@ -674,7 +705,7 @@ async function main() {
   const baseUrl = domain ? `https://${domain}` : extractWorkersDevUrl(deployOutput);
   if (!baseUrl) {
     warn('未能从部署输出中解析出访问地址，跳过线上自测');
-    printSummary({ name, baseUrl: '', token, domain });
+    printSummary({ name, baseUrl: '', token, domain, build });
     return;
   }
 
@@ -686,7 +717,7 @@ async function main() {
 
   if (!verifyOk) printVerifyFailureHint();
 
-  printSummary({ name, baseUrl, token, domain });
+  printSummary({ name, baseUrl, token, domain, build });
   if (!verifyOk) process.exitCode = 1;
 }
 

@@ -14,8 +14,8 @@
 ## 目录结构与职责
 
 ```text
-src/index.js       唯一运行时代码。路由、鉴权、请求体解析、翻译流程、错误映射全在这里。
-scripts/deploy.mjs 交互式部署脚本：登录检查、Worker 命名、Token、可选自定义域名、部署与线上自测；仅用 Node 内置模块。
+src/index.js       唯一运行时代码。路由、鉴权、请求体解析、模型链（主 + 兜底）与降级、错误映射全在这里。
+scripts/deploy.mjs 交互式部署脚本：登录检查、Worker 命名、Token、可选自定义域名、部署（自动注入 git SHA 作为构建标识）与线上自测；仅用 Node 内置模块。
 test/worker.test.js Node 内置 test runner 测试；`env.AI` 使用 stub，不访问 Cloudflare。
 .github/workflows/ci.yml  GitHub Actions：push / pull_request 时跑 check + test。
 wrangler.toml      部署配置。AI binding、可调变量、可选 KV；不放任何密钥。
@@ -40,19 +40,28 @@ LICENSE            MIT 许可证（Copyright (c) 2026 AITranslate contributors�
 - 文本生成类模型约 300 rpm，翻译类约 720 rpm；Free 计划另有 100,000 请求/天、10ms CPU 限制。
 - 错误码必须经 `mapAIError` 转成稳定的 HTTP 语义，**禁止把上游原始异常直接抛给客户端**：
 
-| AI 错误码 | 对外 HTTP | 含义 |
-|---|---|---|
-| `3036` | 429 | 当日免费配额耗尽（配置 KV 时写熔断标记） |
-| `3040` | 429 | 上游容量不足，可重试 |
-| `5035` | 403 | 模型需要 Workers Paid |
-| `5016` | 403 | 未同意模型条款 |
-| `3006` | 413 | 请求超过模型上限 |
-| `3007` / `3008` | 504 | 推理超时 |
-| 其他 429 | 429 | 被限流 |
-| 其他 | 503 | 统一兜底 |
+| AI 错误码 | 对外 HTTP | 含义 | 模型链行为 |
+|---|---|---|---|
+| `3036` | 429 | 当日免费配额耗尽（配置 KV 时写熔断标记） | 不换模型（同一份额度） |
+| `3040` | 429 | 上游容量不足，可重试 | 同模型重试一次，再换兜底 |
+| `5035` | 403 | 模型需要 Workers Paid | 直接换兜底 |
+| `5016` | 403 | 未同意模型条款 | 直接换兜底 |
+| `5028` | 410 | 模型被 Cloudflare 停用，需换成在册模型 | 直接换兜底 |
+| `3006` | 413 | 请求超过模型上限 | 不换模型 |
+| `3007` / `3008` | 504 | 推理超时 | 直接换兜底（不在同一模型上再等一次） |
+| 其他 429 | 429 | 被限流（按模型计） | 直接换兜底 |
+| 其他有码 | 503 | 兜底，message 带上 `Workers AI error <code>` | 同模型重试一次，再换兜底 |
+| 其他无码 | 503 | 兜底，`Translation failed` | 同模型重试一次，再换兜底 |
+
+`AppError` 用 `retryable`（同模型可再试一次）与 `switchModel`（该模型没救，立刻换兜底）两个标记驱动上面的行为；两个标记都没有的错误直接透传，不允许悄悄降级。
+
+binding 抛出的错误实测形态：构造函数是 `InferenceUpstreamError`、`err.name === 'AiError'`、**没有 `code` 字段**，码值只出现在 `err.message` 开头（`5028: <text>`）；`err.stack` 才会带上 `AiError: ` 前缀。Workers AI 用 4 位码，REST / 账号级还有 5 位码（`10021: ...`，也可能写成 `... [10021]`）。提取码值统一走 `aiErrorCode()`，不要拿随机 reference 串做正则。
+
+模型链失败后的报错顺序（`translateChunk` 收尾）：一个正文都没拿到时，报**配置类**错误（`410`/`403`）优先、否则报链上**第一个**上游错误；拿到过正文但被判不合格时，只要链上出现过 `429`/`504` 就保留它（客户端需要退避信号），其余情况 `503 Translation failed: <原因>`。`ATTEMPTS_PER_MODEL`（默认 2）只管单条请求，批量固定 1 次。
 
 - `env.AI` 必须存在；缺失时返回 500 并提示检查 `[ai] binding = "AI"`。
 - `wrangler dev` 的 AI 推理同样走远端并消耗真实配额。
+- **本地 dev 不能用来验证模型行为**：部分网络环境下 `wrangler dev` 的远端 binding 通道整条不可用（所有模型都是约 75 秒后 `Error inside ProxyWorker ... internal error`，与 Worker 代码无关）。要验证真实推理，就部署到边缘：用 `npx wrangler deploy --name <一次性探针名>` 部署同一份代码（探针不设 `TOKEN` 就能直接 curl），验完 `npx wrangler delete <探针名>`；线上排错用 `npx wrangler tail`（其输出没有耗时字段，只有 request/response/logs）。
 
 ### 2. 鉴权
 
@@ -90,11 +99,21 @@ X-Auth-Key: <token>
   - DeepL 官方：`{translations: [{detected_source_language, text}]}`；`auto` 时 `detected_source_language` 固定为 `"AUTO"`（无真实语言检测）。
 - `/translate` 表单请求走 DeepL 官方响应；`/v2/translate` 无论 JSON 还是表单都走官方响应。
 - 错误响应统一为 `{code, message}`，且 HTTP 状态码与 `code` 相同。
+- `GET /` 回显 `{code, message, build, model, fallback_model, endpoints, limits}`。`build` 取自部署时注入的 `BUILD` 变量，未注入时必须是 `null`，不要为它造默认值。它是判断「线上跑的是哪份代码」的唯一凭据——wrangler 打包后堆栈行号与仓库不一致，别用行号反推版本；`-dirty` 后缀代表部署的是未提交改动。
 
 ### 5. 模型切换
 
-- 只通过 `MODEL` 环境变量切换，默认 `@cf/qwen/qwen3-30b-a3b-fp8`。
+- 模型链由两个变量决定：`MODEL`（主，默认 `@cf/mistralai/mistral-small-3.1-24b-instruct`）与 `FALLBACK_MODEL`（兜底，默认 `@cf/ibm-granite/granite-4.0-h-micro`）。`FALLBACK_MODEL` 设为空串即关闭兜底。
+- 每个模型的调用次数由 `ATTEMPTS_PER_MODEL`（默认 2）决定，批量请求固定压到 1 次：重试次数与条数相乘会把一次请求拖成上百次上游调用。
+- 兜底模型接不住这个请求时必须先跳过再报错（如 M2M100 + `source_lang=auto`），不允许把兜底自身的 400 报成用户的参数错误。
+- 兜底模型失败的错误也不许顶替主模型：配置类（`410`/`403`）优先报出，偶发 `503` 靠后；`5028` 报文点名真正失败的模型及其对应变量。
+- 译文按**实际用到的模型**入缓存（缓存键含模型名），主模型恢复后不会被旧兜底结果顶掉；长文本分段若各段用了不同模型，结果不缓存。
+- Cloudflare 会定期停用 Workers AI 模型（2026-11-20 停用 24 个，含旧的默认模型 `@cf/qwen/qwen3-30b-a3b-fp8`）。变更前先用 `npx wrangler ai models list` 确认在册；调用已停用模型返回 `410 / 5028`。
+- 不做主动探测：模型下架只在请求真的失败时才暴露（`GET /` 只回显配置的模型名，不测可用性）。想提前发现，靠 `wrangler tail` 日志或客户端报出的 410，不要在没有需求时加定时器与健康检查——已明确决定不做。
 - 代码按模型名分支：`isM2M100()` 走 `{text, source_lang, target_lang}` 入参，其余走 chat messages。
+- `callModel` 必须同时兼容两种上游返回：老的 `{ response }` 与 OpenAI 兼容的 `choices[].message.content`（思考内容在 `message.reasoning` / `reasoning_content`，不得混入译文）。取正文统一走 `extractText`。
+- 正文为空必须判为失败（重试后 503），**不允许返回 200 + 空字符串**——客户端会显示"无反应"，比报错更难排查。例外：整段只有占位符、没有可译文字（如 `<p></p>`）时原样返回，不调用模型。
+- 带思考输出的模型（Gemma 4、Qwen3.8 等）把思考算进输出预算，`maxTokensFor` 必须留出思考空间；选默认模型优先选无思考的，别用延迟和空输出换质量。
 - M2M100 不支持 `AUTO`，必须显式 `source_lang`，否则 400。
 - 无论换哪个模型，都必须保留：显式 `max_tokens`、reasoning 清理、占位符校验、长文本分段。
 - 新模型若改变输出结构，先补 `cleanOutput` 与回归，再改默认值。
@@ -102,7 +121,7 @@ X-Auth-Key: <token>
 ### 6. 文本处理不变量
 
 - 单请求总字符数上限 `MAX_TOTAL_CHARS`（默认 1500），超限 413。
-- HTML/XML 标签保护使用 `⟦n⟧` 占位符；翻译后必须校验所有占位符都存在，缺失重试一次，仍失败返回 503。
+- HTML/XML 标签保护使用 `⟦n⟧` 占位符；翻译后必须校验所有占位符都存在，缺失先用更严格 prompt 重试，再换兜底模型，全链试完仍失败才返回 503。整段只有占位符、没有可译文字时直接原样返回，不调用模型。
 - 长文本按 段落 → 句子 → 硬切分；硬切分不得从占位符中间切断。
 - 输出清洗要处理：BOM、`<think>`/reasoning 块、`<text>` 包裹、代码块、成对引号、`Translation:` 类前缀。
 - 批量结果顺序必须与输入顺序一致。
@@ -114,7 +133,7 @@ npm install
 npx wrangler login      # AI 推理走远端，必须先登录
 npm run dev             # http://localhost:8787
 npm run check           # node --check src/index.js
-npm run deploy
+npm run deploy          # 交互脚本会自动注入构建标识；手动部署补上 --var BUILD:$(git rev-parse --short HEAD)
 ```
 
 本地 Token：`.dev.vars` 写 `TOKEN=dev-token`（已被 `.gitignore` 忽略）。线上 Token 用 `npx wrangler secret put TOKEN`。
@@ -128,11 +147,18 @@ npm run deploy
 5. 无 token → 401；带 `DeepL-Auth-Key` → 200；
 6. 缺 `text` → 400；超 1500 字符 → 413。
 
+改模型链或错误映射时，再用探针 Worker（见第 1 节）在边缘验这三条降级路径：
+
+7. `MODEL` 设成已停用模型（如 `@cf/qwen/qwen3-30b-a3b-fp8`）：应仍返回 200，译文来自兜底模型；
+8. 上一步基础上再把 `FALLBACK_MODEL` 设空：应返回 410，且报文点名真正失败的模型与对应变量名；
+9. `MODEL` 正常、`FALLBACK_MODEL=@cf/meta/m2m100-1.2b`，请求不带 `source_lang`：主模型失败时应报上游 503，**不该**报 M2M100 的 400。
+
 ## 修改约定
 
 - **不要硬编码任何密钥、Token、账号 ID、子域名或真实部署地址**。示例一律用 `<your-domain>`、`<token>` 这类占位符。
 - 不要把 `.dev.vars`、`.wrangler/`、`.wrangler-home/`、`.env*` 提交进仓库。
 - 不新增依赖；确需新增时先说明理由并确认能被 wrangler 打包。
+- 部署要带构建标识：`scripts/deploy.mjs` 自动注入 `--var BUILD:<git short SHA>`（工作区未提交时带 `-dirty`），手动部署自行补上。不要把 SHA 写死进 `wrangler.toml`，也不要在 `src/index.js` 里维护手写版本号——两处版本一定会漂移。
 - 改路由或响应字段必须同步更新 `README.md` 与 `AGENTS.md`。
 - 未验证的能力写进「已知限制」，不要写进「支持」。
 - 删除功能时一并删除对应分支、注释与文档，不保留向后兼容的空壳。

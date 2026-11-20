@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/JosephusZhou/CFWorkerAITranslate/actions/workflows/ci.yml/badge.svg)](https://github.com/JosephusZhou/CFWorkerAITranslate/actions/workflows/ci.yml)
 
-用 **Cloudflare Workers AI** 免费额度提供 DeepLX / DeepL 兼容的翻译接口。默认模型 `@cf/qwen/qwen3-30b-a3b-fp8`，单文件实现、无第三方运行时依赖。
+用 **Cloudflare Workers AI** 免费额度提供 DeepLX / DeepL 兼容的翻译接口。主模型 `@cf/mistralai/mistral-small-3.1-24b-instruct`，兜底模型 `@cf/ibm-granite/granite-4.0-h-micro`，单文件实现、无第三方运行时依赖。
 
 适合这些场景：
 
@@ -50,7 +50,7 @@ npm run deploy:interactive
 3. 询问是否自定义 Worker 名称，并写入 `wrangler.toml` 的 `name`；
 4. 询问 TOKEN 方式：自动生成 48 位随机串、手动输入或暂不设置；
 5. 询问是否绑定自定义域名；
-6. 执行 `wrangler deploy`，写入 `TOKEN` secret，并请求线上接口自测（含 401 校验）。
+6. 执行 `wrangler deploy`（自动带上 `--var BUILD:<git short SHA>` 作为构建标识，工作区有未提交改动时后缀 `-dirty`），写入 `TOKEN` secret，并请求线上接口自测（含 401 校验）。
 
 说明：
 
@@ -96,7 +96,7 @@ npx wrangler whoami
 npm run dev
 ```
 
-默认监听 `http://localhost:8787`。**注意**：本地开发也会调用远端 Workers AI，会消耗真实配额。
+默认监听 `http://localhost:8787`。**注意**：本地开发也会调用远端 Workers AI，会消耗真实配额；部分环境下这条远端通道整条不可用（见文末「排错」），本地跑不通不代表线上有问题。
 
 另开一个终端测试：
 
@@ -137,6 +137,14 @@ name = "my-deeplx"
 npm run deploy
 ```
 
+想给线上代码打上可辨认的构建标识（`GET /` 的 `build` 字段），用交互式部署会自动注入；手动部署时带上 `--var`：
+
+```bash
+npx wrangler deploy --var BUILD:$(git rev-parse --short HEAD)
+```
+
+Windows 下 `$(...)` 不适用：直接用 `npm run deploy:interactive`（脚本会自动注入），或先单独执行 `git rev-parse --short HEAD` 取值，再把它原样填进 `npx wrangler deploy --var BUILD:<值>`。
+
 部署成功后终端会打印类似：
 
 ```text
@@ -148,7 +156,7 @@ https://ai-deeplx.<你的子域名>.workers.dev
 第一次部署前，账号侧还需要确认：
 
 - Workers AI 在账号中可用（免费计划默认开启，每日 10,000 Neurons）；
-- 使用 Llama 等模型前，需在 Cloudflare Dashboard 的 Workers AI 页面同意模型条款，否则返回 `403 / 5016`。
+- 使用 Llama 等模型前，需在 Cloudflare Dashboard 的 Workers AI 页面同意模型条款；未同意时该模型返回 `403 / 5016`，Worker 会自动改用兜底模型，两个都不可用才对客户端报 `403`。
 
 ### 7. 设置访问 Token（强烈建议）
 
@@ -194,6 +202,27 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 
 应输出 `401`。
 
+想确认线上跑的是哪份代码、用的是哪两个模型，请求根路径（不需要 Token）：
+
+```bash
+curl -s "https://<worker-name>.<你的子域名>.workers.dev/"
+```
+
+```json
+{
+  "code": 200,
+  "message": "AI DeepLX compatible worker",
+  "build": "1a2b3c4",
+  "model": "@cf/mistralai/mistral-small-3.1-24b-instruct",
+  "fallback_model": "@cf/ibm-granite/granite-4.0-h-micro",
+  "endpoints": ["/translate", "/v2/translate"],
+  "limits": { "max_total_chars": 1500, "max_items": 30 }
+}
+```
+
+- `build` 是部署时注入的 git short SHA；带 `-dirty` 说明部署的是**未提交**的改动（线上代码和那个 commit 并不完全一致）；为 `null` 说明这次部署没注入。
+- `model` / `fallback_model` 只回显配置值，**不测试模型可用性**——模型是否已下架要看真实请求的 `410`，或跑 `npx wrangler ai models list` 对照。
+
 ### 9. 查看实时日志
 
 ```bash
@@ -219,7 +248,7 @@ Easydict 会把 API 地址原样作为请求 URL，不会在末尾追加 `/v2/tr
 | `/translate` | `POST` | 表单（DeepL 官方风格） | `{translations: [{detected_source_language, text}]}` |
 | `/v2/translate` | `POST` | JSON 或表单 | `{translations: [{detected_source_language, text}]}` |
 | `/translate` | `GET` | — | 纯文本 `Please use POST method :)` |
-| `/` | `GET` | — | 当前模型与限制信息 |
+| `/` | `GET` | — | 构建标识、主模型、兜底模型与限制信息 |
 | `/v1/translate` | 任意 | — | `501`（未实现） |
 
 - `text` 传字符串是单条，传字符串数组是批量（表单里重复 `text` 字段等价于批量）。
@@ -253,14 +282,17 @@ curl -s https://<你的域名>/v2/translate \
 
 | 名称 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `MODEL` | var | `@cf/qwen/qwen3-30b-a3b-fp8` | 翻译模型，可换成其他 Workers AI 文本模型 |
+| `MODEL` | var | `@cf/mistralai/mistral-small-3.1-24b-instruct` | 主模型，可换成其他 Workers AI 文本模型 |
+| `FALLBACK_MODEL` | var | `@cf/ibm-granite/granite-4.0-h-micro` | 兜底模型；主模型上游报错/被停用时改用它，设为 `""` 关闭兜底 |
 | `MAX_TOTAL_CHARS` | var | `1500` | 单请求（批量合计）最大 UTF-16 字符数，对齐 DLX |
 | `MAX_ITEMS` | var | `30` | 批量最多文本段数 |
 | `SEGMENT_CHARS` | var | `1000` | 单段超过该长度时先切分再逐段翻译 |
 | `MAX_OUTPUT_TOKENS` | var | `4096` | 输出上限，避免模型默认 256 token 截断长文 |
 | `TEMPERATURE` | var | `0.1` | 采样温度 |
 | `CONCURRENCY` | var | `2` | 批量时的并发 AI 调用数 |
+| `ATTEMPTS_PER_MODEL` | var | `2` | 单条请求时每个模型最多调用几次；批量请求固定压到 1 次 |
 | `CACHE_TTL` | var | `86400` | KV 缓存 TTL（秒） |
+| `BUILD` | var（部署注入） | 未注入 → `null` | git short SHA，`GET /` 的 `build` 字段；工作区未提交时带 `-dirty` |
 | `TOKEN` | secret | 空 | 设置后启用鉴权；为空则不校验（公网部署务必设置） |
 | `AI` | AI binding | `[ai]` | 必需，名称必须与代码里的 `env.AI` 一致 |
 | `CACHE` | KV binding | 未绑定 | 可选；启用精确缓存与配额熔断 |
@@ -281,22 +313,38 @@ curl -s https://<你的域名>/v2/translate \
 npm test
 ```
 
-测试覆盖 JSON / 表单两种请求体、`/translate` 与 `/v2/translate` 两种响应、HTML 占位符还原、鉴权各形式与 400/401/404/405/413 错误语义。`env.AI` 全部使用 stub，不会发起真实推理。
+测试覆盖 JSON / 表单两种请求体、`/translate` 与 `/v2/translate` 两种响应、HTML 占位符还原、鉴权各形式、400/401/404/405/413/410/429/503 错误语义，以及模型链降级：主模型上游报错重试、`410` 停用直接换兜底、兜底接不住 `AUTO` 时跳过它、`3036` 配额不换模型、混用模型的结果不写缓存。上游返回同时覆盖老的 `{ response }` 与 OpenAI 兼容的 `choices[].message.content` 两种结构。`env.AI` 全部使用 stub，不会发起真实推理。
 
 ## 切换模型
 
-只改 `wrangler.toml` 的 `MODEL`，然后重新部署：
+改 `wrangler.toml` 的 `MODEL`（主模型）与 `FALLBACK_MODEL`（兜底模型），然后重新部署：
 
 ```toml
 [vars]
-MODEL = "@cf/meta/m2m100-1.2b"
+MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct"
+FALLBACK_MODEL = "@cf/ibm-granite/granite-4.0-h-micro"
 ```
 
 ```bash
 npm run deploy
 ```
 
-可用模型示例：`@cf/meta/llama-3.2-3b-instruct`、`@cf/ibm-granite/granite-4.0-h-micro`、`@cf/meta/m2m100-1.2b`、`@cf/meta/llama-3.3-70b-instruct-fp8-fast`。
+主模型失败时会自动走兜底模型。每个模型默认最多调用两次（`ATTEMPTS_PER_MODEL`），**批量请求压到一次**——重试次数与条数相乘会把一次请求拖成上百次上游调用：
+
+| 失败原因 | 行为 |
+|---|---|
+| 上游内部错误 / 无码 503、容量不足 | 同一模型先重试一次（批量不重试），仍失败再换兜底模型 |
+| 推理超时 | 不重复等待，直接换兜底模型 |
+| 模型被停用（`410`）、需要 Paid、未同意条款、按模型限流 | 不重复调用主模型，直接换兜底模型 |
+| 正文为空、返回解释性文字、丢占位符 | 用更严格 prompt 重试一次，仍不合格换兜底模型 |
+| 当日 Neurons 配额耗尽（`3036`）、请求超长（`3006`） | 不换模型，直接返回 `429` / `413`（换模型也消耗同一份额度） |
+| 兜底模型接不住这个请求（如 M2M100 遇到 `source_lang=auto`） | 跳过该模型，绝不把它的 400 当成用户的错 |
+
+两个模型都失败时，对外状态码按"最该动手修的那个"排序：配置类错误（`410` / `403`）优先于偶发 `503`，限流与超时会保留 `429` / `504` 让客户端退避；报文点名的模型与变量（`MODEL` 还是 `FALLBACK_MODEL`）就是真正失败的那个。
+
+模型选择提示：带思考输出的模型（`@cf/google/gemma-4-26b-a4b-it`、`@cf/qwen/qwen3.8-27b`）把思考也算进输出预算，实测短句要 10~28 秒，预算不足时正文会是空的，不适合查词；实测 `mistral-small-3.1-24b-instruct` 约 1.7~3.3 秒、`granite-4.0-h-micro` 约 1.5~2.3 秒。
+
+> Cloudflare 会定期停用旧模型（2026-11-20 一次性停用了 24 个，含 `@cf/qwen/qwen3-30b-a3b-fp8`、`@cf/zai-org/glm-5.3-flash`）。选模型前先确认还在册：`npx wrangler ai models list`；请求已停用的模型会返回 `410 / 5028`。
 
 > M2M100 不支持自动检测，调用时必须显式传 `source_lang`，否则返回 `400`。
 
@@ -352,14 +400,20 @@ HTTP 状态码与响应体 `code` 一致：
 | 免费 Neuron 配额用尽 | 429 | 对应 AI `3036`；配置 KV 后会熔断到 UTC 00:00 |
 | 上游容量不足 | 429 | 对应 AI `3040`，可重试 |
 | 模型需要 Paid / 未同意条款 | 403 | 对应 AI `5035` / `5016` |
-| 模型输出连续两次不合格 | 503 | 占位符丢失或返回解释性文字 |
-| 推理超时 | 504 | 对应 AI `3007` / `3008` |
+| 模型已被 Cloudflare 停用 | 410 | 对应 AI `5028`；报文点名的是真正失败的模型，改它对应的 `MODEL` 或 `FALLBACK_MODEL` |
+| 模型输出不合格（主 + 兜底都试过） | 503 | `Translation failed: <原因>`，原因为正文为空 / 丢占位符 / 返回解释性文字 |
+| 上游错误（主 + 兜底都失败） | 503 / 504 / 429 | 报链上第一个上游错误；无码时 `Translation failed`，有码时带 `Workers AI error <code>`；链上出现过 `429`/`504` 时保留它，便于客户端退避 |
+| 推理超时 | 504 | 对应 AI `3007` / `3008`；不在同一模型上重复等待，先换兜底模型 |
 
 ## 已处理的工程问题
 
-- **`max_tokens` 显式设置**：按源文本估算（CJK 1.3 token/字，其他 0.32）并留余量，上限 `MAX_OUTPUT_TOKENS`。
+- **主模型 + 兜底模型**：主模型上游报错先重试一次（批量不重试），仍失败换 `FALLBACK_MODEL`；`410` 停用 / `5035` 需 Paid / `5016` 未同意条款 / `3007`·`3008` 超时这类"换模型才有救"的错误直接切换，不在同一模型上重复等待。`3036` 配额与 `3006` 超长不换模型。
+- **兜底不越权**：兜底模型自身接不住请求（如 M2M100 的 `AUTO` 限制）时直接跳过它，绝不把它的 400 报给用户；报错时配置类（`410`/`403`）优先于偶发 `503`，限流与超时保留 `429`/`504`。
+- **两种返回结构都认**：Workers AI 老的 `{ response }` 与现在这些模型用的 OpenAI 兼容结构 `{ choices: [{ message: { content } }] }` 都能取到正文；`reasoning` / `reasoning_content` 不会混进译文。
+- **空正文不静默**：模型返回空内容时按失败处理（更严格 prompt 重试一次，仍空则 503），不会再给客户端 `200` + 空译文导致界面无反应。
+- **`max_tokens` 含思考预留**：按源文本估算（CJK 1.3 token/字，其他 0.32）算出正文用量，再叠加 `max(512, 源文本估算)` 的思考空间，上限 `MAX_OUTPUT_TOKENS`。带思考输出的模型（Gemma 4、Qwen3.8 等）思考也算输出，预算不足时正文会是空的。
 - **reasoning 过滤**：去掉 `<think>…</think>` 等块；Qwen3/GLM 额外追加 `/no_think`；输出像解释性文字时用更严格 prompt 重试一次。
-- **HTML/XML 占位符保护**：`tag_handling=html|xml` 时把标签替换为 `⟦n⟧`，翻译后校验并还原；缺失则重试，仍失败返回 503。
+- **HTML/XML 占位符保护**：`tag_handling=html|xml` 时把标签替换为 `⟦n⟧`，翻译后校验并还原；缺失先用更严格 prompt 重试，再换兜底模型，全链试完仍失败才返回 503。整段只有标签、没有可译文字时直接原样返回，不调用模型。
 - **超长文本分段**：按段落 → 句子 → 硬切分；硬切分避开占位符，译文按顺序拼回。
 - **配额语义**：`3036` 不重试，配置 KV 时写入当天熔断标记，次日 UTC 00:00 自动解除。
 - **批量并发可控**：默认 2 路并发，结果顺序与输入一致。
@@ -377,6 +431,8 @@ HTTP 状态码与响应体 `code` 一致：
 | 超长文档 | 默认按 DLX 语义返回 413；调高 `MAX_TOTAL_CHARS` 后需自行分段 |
 | 多 Key 轮询 / 多账号 | 未实现，免费额度用尽建议升级 Workers Paid |
 | 强一致限流 | 未实现；KV 为最终一致，仅用于近似缓存与熔断 |
+| 兜底后的译文一致性 | 不保证。同一段文本可能今天来自主模型、某天来自兜底模型，措辞会不同；只有 KV 缓存按实际用到的模型分开存 |
+| 模型下架的提前发现 | 不做主动探测（无健康检查、无定时器）。只有请求真的失败时才暴露：主模型挂了会被兜底悄悄救掉（返回 200，没有提示），主兜底都挂了才报 `410`；提前发现靠 `npx wrangler ai models list` 或 `npx wrangler tail` 日志 |
 
 ## 停用与删除
 
@@ -416,12 +472,15 @@ npx wrangler logout
 ## 排错
 
 - `AI binding is not configured`：检查 `wrangler.toml` 的 `[ai] binding = "AI"`。
-- `403 / 5016`：到 Cloudflare Dashboard 的 Workers AI 页面同意对应模型条款。
-- `403 / 5035`：该模型需要 Workers Paid，换回默认模型。
+- `403 / 5016`：到 Cloudflare Dashboard 的 Workers AI 页面同意对应模型条款（Worker 会先自动改用兜底模型，两个都不可用才报到这里）。
+- `403 / 5035`：该模型需要 Workers Paid；兜底模型也是免费可用的话就不会报出来，真报出来说明两个都需要 Paid，换回免费在册模型。
+- `410 / 5028`：报文里点名的模型已被 Cloudflare 停用（例如 `@cf/qwen/qwen3-30b-a3b-fp8` 停在 2026-11-20）；按它点名的变量（`MODEL` 或 `FALLBACK_MODEL`）换成在册模型，`npx wrangler ai models list` 可查，再 `npm run deploy`。
+- `503 Translation failed`：上游返回了未收录的错误。日志里的 `[ai-error]` 有原始码，先按码值判断，再考虑换模型。
 - `429`：免费额度按 Cloudflare 账号统计，UTC 00:00（北京时间 08:00）重置。
 - `1010` 或非浏览器请求被拒：`*.workers.dev` 对部分 UA 有边缘限制，用浏览器 UA 或自定义域名复测。
-- 本地 `wrangler dev` 调用慢或 `InferenceUpstreamError`：远程 binding 通道问题，可改用 `npm run deploy` 后验证；不影响线上逻辑。
+- 本地 `wrangler dev` 调用慢、或所有模型都约 75 秒后报 `InferenceUpstreamError: internal error` / `Error inside ProxyWorker`：这是远程 binding 通道的问题（换网络/代理有时也没用），与 Worker 代码无关，**不能用它验证模型行为**。改用最靠得住的办法：`npx wrangler deploy --name <一次性探针名>` 把同一份代码部署到边缘（探针不设 `TOKEN` 就能直接 curl），验完 `npx wrangler delete <一次性探针名>`；或者直接 `npm run deploy` 后用 `npx wrangler tail` 看线上日志。
 - `npx wrangler` 报 Node 版本过低：升级到 Node.js 22+。
+- 想确认线上跑的是哪份代码：`curl https://<你的地址>/` 看 `build`。带 `-dirty` 表示部署的是**未提交**改动；`null` 表示这次部署没注入构建标识。不要用 `wrangler tail` 里的堆栈行号去对仓库行号——wrangler 打包后行号会变，对不上并不说明线上代码不同。
 
 ## 许可证
 

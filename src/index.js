@@ -11,7 +11,8 @@
  * 接口形态与设计取舍见 README.md。
  */
 
-const DEFAULT_MODEL = '@cf/qwen/qwen3-30b-a3b-fp8';
+const DEFAULT_MODEL = '@cf/mistralai/mistral-small-3.1-24b-instruct';
+const DEFAULT_FALLBACK_MODEL = '@cf/ibm-granite/granite-4.0-h-micro';
 const PLACEHOLDER_RE = /⟦\s*(\d+)\s*⟧/g;
 
 /** 可直接映射的 DeepL 语言码 -> [ISO 639-1, 提示用语言名] */
@@ -64,9 +65,12 @@ const LANGS = {
 };
 
 class AppError extends Error {
-  constructor(status, message) {
+  constructor(status, message, flags = {}) {
     super(message);
     this.status = status;
+    // retryable：同一模型可以再试一次；switchModel：这个模型没救了，直接换下一个。
+    this.retryable = Boolean(flags.retryable);
+    this.switchModel = Boolean(flags.switchModel);
   }
 }
 
@@ -112,7 +116,9 @@ function handleRoot(env) {
   return jsonResponse(200, {
     code: 200,
     message: 'AI DeepLX compatible worker',
+    build: env.BUILD || null,
     model: cfg.model,
+    fallback_model: cfg.fallbackModel || null,
     endpoints: ['/translate', '/v2/translate'],
     limits: { max_total_chars: cfg.maxTotalChars, max_items: cfg.maxItems },
   });
@@ -133,6 +139,8 @@ async function handleTranslate(request, env, url, official) {
 
   const isBatch = Array.isArray(body.text);
   const texts = isBatch ? body.text : [body.text];
+  // 批量时不做同模型重试：重试与条数相乘会把一次请求拖成上百次上游调用。
+  if (isBatch) cfg.attemptsPerModel = 1;
   validateTexts(texts, cfg);
 
   const source = resolveLang(body.source_lang || 'auto', true);
@@ -191,6 +199,9 @@ function readConfig(env) {
 
   return {
     model: env.MODEL || DEFAULT_MODEL,
+    // FALLBACK_MODEL 设为空串表示不要兜底模型。
+    fallbackModel:
+      env.FALLBACK_MODEL === undefined ? DEFAULT_FALLBACK_MODEL : String(env.FALLBACK_MODEL).trim(),
     maxTotalChars: num(env.MAX_TOTAL_CHARS, 1500),
     maxItems: num(env.MAX_ITEMS, 30),
     segmentChars: num(env.SEGMENT_CHARS, 1000),
@@ -198,6 +209,8 @@ function readConfig(env) {
     temperature: Number.isFinite(temperature) ? temperature : 0.1,
     concurrency: num(env.CONCURRENCY, 2),
     cacheTtl: num(env.CACHE_TTL, 86400),
+    // 每个模型允许的调用次数；批量请求会压到 1，避免重试次数与条数相乘。
+    attemptsPerModel: num(env.ATTEMPTS_PER_MODEL, 2),
   };
 }
 
@@ -301,7 +314,7 @@ async function translateMany(env, cfg, texts, source, target, tagHandling) {
 async function translateItem(env, cfg, text, source, target, tagHandling) {
   if (!text.trim()) return text;
 
-  const cached = await cacheGet(env, cfg, source, target, tagHandling, text);
+  const cached = await cacheGet(env, cfg.model, source, target, tagHandling, text);
   if (cached != null) return cached;
 
   await assertQuotaAvailable(env);
@@ -309,63 +322,124 @@ async function translateItem(env, cfg, text, source, target, tagHandling) {
   const protectedText = protectTags(text, tagHandling);
   const chunks = splitLongText(protectedText.text, cfg.segmentChars);
   const parts = [];
+  const usedModels = new Set();
+
   for (const chunk of chunks) {
-    parts.push(await translateChunk(env, cfg, chunk, source, target, tagHandling));
+    const done = await translateChunk(env, cfg, chunk, source, target, tagHandling);
+    parts.push(done.text);
+    usedModels.add(done.model);
   }
 
   const translated = protectedText.restore(parts.join(''));
-  await cachePut(env, cfg, source, target, tagHandling, text, translated);
+  // 缓存键含模型名：兜底产物不能占住主模型的键；多段混用模型的结果无法用单一键表达，直接返回。
+  if (usedModels.size === 1) {
+    await cachePut(env, [...usedModels][0], source, target, tagHandling, text, translated);
+  }
   return translated;
+}
+
+/** 主模型 + 兜底模型，按顺序尝试；FALLBACK_MODEL 为空时只有主模型。 */
+function modelChain(cfg) {
+  return [cfg.model, cfg.fallbackModel].filter((m, i, all) => m && all.indexOf(m) === i);
+}
+
+/** 需要人动手改配置的错误（停用 / 需付费 / 未同意条款），比偶发上游 503 更值得报出来。 */
+function isConfigError(err) {
+  return err.status === 410 || err.status === 403;
 }
 
 async function translateChunk(env, cfg, chunk, source, target, tagHandling) {
   const expectedPlaceholders = collectPlaceholderIndexes(chunk);
-  let lastProblem = 'model returned malformed output';
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const raw = await callModel(env, cfg, chunk, source, target, attempt > 0);
-    const cleaned = cleanOutput(raw);
-
-    if (cleaned.meta) {
-      lastProblem = 'model returned explanatory text instead of a translation';
-      continue;
-    }
-    const missing = expectedPlaceholders.filter(
-      (index) => !new RegExp(`⟦\\s*${index}\\s*⟧`).test(cleaned.text),
-    );
-    if (missing.length > 0) {
-      lastProblem = `model dropped placeholder(s): ${missing.join(', ')}`;
-      continue;
-    }
-    return cleaned.text;
+  // 整段只有占位符、没有可译文字（例如 <p></p>）：原样返回，不必问模型。
+  if (!chunk.replace(PLACEHOLDER_RE, '').trim()) {
+    return { text: chunk, model: cfg.model };
   }
 
+  let lastProblem = 'model returned malformed output';
+  let firstError = null;
+  let backoffError = null; // 429 / 504：客户端最该听到的是"稍后再试"
+  let gotOutput = false;
+
+  for (const model of modelChain(cfg)) {
+    // 兜底模型接不住这个请求（M2M100 不支持 AUTO）：跳过它，
+    // 否则会把一次正常的请求变成 400，让用户以为是自己参数写错了。
+    if (isM2M100(model) && source.auto) continue;
+
+    for (let attempt = 0; attempt < cfg.attemptsPerModel; attempt++) {
+      let raw;
+      try {
+        raw = await callModel(env, cfg, model, chunk, source, target, attempt > 0);
+      } catch (err) {
+        if (!(err instanceof AppError)) throw err;
+        if (!err.retryable && !err.switchModel) {
+          // 请求级错误（配额、超长、鉴权）只有主模型的才值得直接透出；
+          // 兜底模型自身的限制不许顶替主模型的真实错误。
+          if (model === cfg.model) throw err;
+          if (!firstError) firstError = err;
+          break;
+        }
+        if (!firstError) firstError = err;
+        if (isConfigError(err) && !isConfigError(firstError)) firstError = err;
+        if (err.status === 429 || err.status === 504) backoffError = err;
+        if (err.switchModel) break;
+        continue;
+      }
+
+      const cleaned = cleanOutput(raw);
+      gotOutput = true;
+
+      if (!cleaned.text) {
+        lastProblem = 'model returned empty output';
+        continue;
+      }
+      if (cleaned.meta) {
+        lastProblem = 'model returned explanatory text instead of a translation';
+        continue;
+      }
+      const missing = expectedPlaceholders.filter(
+        (index) => !new RegExp(`⟦\\s*${index}\\s*⟧`).test(cleaned.text),
+      );
+      if (missing.length > 0) {
+        lastProblem = `model dropped placeholder(s): ${missing.join(', ')}`;
+        continue;
+      }
+      return { text: cleaned.text, model };
+    }
+  }
+
+  // 全程没拿到正文：报第一个上游错误（通常是用户配的那个模型的真实问题）。
+  if (!gotOutput) {
+    throw firstError || new AppError(503, `Translation failed: ${lastProblem}`);
+  }
+  // 拿到过正文但被判不合格，而最后一步是限流/超时：用可退避的语义更准。
+  if (backoffError) throw backoffError;
   throw new AppError(503, `Translation failed: ${lastProblem}`);
 }
 
-async function callModel(env, cfg, text, source, target, strict) {
+async function callModel(env, cfg, model, text, source, target, strict) {
   if (!env.AI) {
     throw new AppError(500, 'AI binding is not configured (add [ai] binding = "AI" in wrangler.toml)');
   }
 
   try {
-    if (isM2M100(cfg.model)) {
+    if (isM2M100(model)) {
       if (source.auto) {
         throw new AppError(400, 'M2M100 requires an explicit source_lang (AUTO is not supported)');
       }
       const result = await env.AI.run(
-        cfg.model,
+        model,
         { text, source_lang: source.iso, target_lang: target.iso },
         { rejectIfBusy: true },
       );
-      return String(result?.translated_text ?? result?.response ?? result?.text ?? '');
+      return extractText(result);
     }
 
     const result = await env.AI.run(
-      cfg.model,
+      model,
       {
         messages: [
-          { role: 'system', content: buildPrompt(source, target, cfg.model, strict) },
+          { role: 'system', content: buildPrompt(source, target, model, strict) },
           { role: 'user', content: `<text>\n${text}\n</text>` },
         ],
         max_tokens: maxTokensFor(text, cfg.maxOutputTokens),
@@ -375,12 +449,30 @@ async function callModel(env, cfg, text, source, target, strict) {
       },
       { rejectIfBusy: true },
     );
-    return String(result?.response ?? '');
+    return extractText(result);
   } catch (err) {
     if (err instanceof AppError) throw err;
     console.error('[ai-error]', (err && (err.stack || err.message)) || String(err));
-    throw await mapAIError(env, err);
+    throw await mapAIError(env, err, model, cfg);
   }
+}
+
+/**
+ * Workers AI 的返回值有两种形态：老的 `{ response }`，以及现在这些模型用的
+ * OpenAI 兼容结构 `{ choices: [{ message: { content, reasoning } }] }`。
+ * 正文只取 content；reasoning 在独立字段里，不会混进译文。
+ */
+function extractText(result) {
+  const candidates = [
+    result?.response,
+    result?.translated_text,
+    result?.text,
+    result?.choices?.[0]?.message?.content,
+  ];
+  for (const value of candidates) {
+    if (typeof value === 'string' && value) return value;
+  }
+  return '';
 }
 
 function buildPrompt(source, target, model, strict) {
@@ -430,8 +522,14 @@ function estimateTokens(text) {
   return Math.ceil(cjk * 1.3 + other * 0.32);
 }
 
+/**
+ * 带思考输出的模型（Gemma 4、Qwen3.8 等）把思考也算进输出预算：预算不够时
+ * content 直接返回空，正文全被思考吃掉。所以除了正文，还要按源文长度预留思考空间。
+ */
 function maxTokensFor(text, cap) {
-  return Math.max(64, Math.min(cap, Math.ceil(estimateTokens(text) * 1.8) + 64));
+  const est = estimateTokens(text);
+  const needed = Math.ceil(est * 1.8) + Math.max(512, est);
+  return Math.max(64, Math.min(cap, needed));
 }
 
 function cleanOutput(raw) {
@@ -587,20 +685,20 @@ function safeCut(text, start, end, maxLen) {
 // 缓存与配额熔断（可选 KV binding: CACHE）
 // ---------------------------------------------------------------------------
 
-async function cacheGet(env, cfg, source, target, tagHandling, text) {
+async function cacheGet(env, model, source, target, tagHandling, text) {
   if (!env.CACHE) return null;
-  const key = await cacheKey(cfg, source, target, tagHandling, text);
+  const key = await cacheKey(model, source, target, tagHandling, text);
   return (await env.CACHE.get(key)) ?? null;
 }
 
-async function cachePut(env, cfg, source, target, tagHandling, sourceText, translated) {
+async function cachePut(env, model, source, target, tagHandling, sourceText, translated) {
   if (!env.CACHE) return;
-  const key = await cacheKey(cfg, source, target, tagHandling, sourceText);
-  await env.CACHE.put(key, translated, { expirationTtl: cfg.cacheTtl });
+  const key = await cacheKey(model, source, target, tagHandling, sourceText);
+  await env.CACHE.put(key, translated, { expirationTtl: readConfig(env).cacheTtl });
 }
 
-async function cacheKey(cfg, source, target, tagHandling, text) {
-  const data = `${cfg.model}|${source.iso}|${target.iso}|${tagHandling || ''}|${text}`;
+async function cacheKey(model, source, target, tagHandling, text) {
+  const data = `${model}|${source.iso}|${target.iso}|${tagHandling || ''}|${text}`;
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(data));
   const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
   return `tr:v1:${hex}`;
@@ -633,37 +731,68 @@ function secondsUntilUtcMidnight() {
 // 错误映射（Workers AI -> DeepLX 语义）
 // ---------------------------------------------------------------------------
 
-async function mapAIError(env, err) {
-  const message = String((err && (err.message || err.stack)) || err || '');
-  const rawCode = Number(err?.code);
-  let code = Number.isFinite(rawCode) ? rawCode : 0;
+/**
+ * Workers AI binding 的错误对象是 `InferenceUpstreamError`（`name` 为 `AiError`），
+ * 没有独立的 code 字段：错误码只出现在 message 开头，形如 `5028: <text>`。
+ * 只认这个位置，避免上游随机 reference 串里的数字被误读成错误码。
+ */
+function aiErrorCode(err) {
+  const raw = Number(err?.code);
+  if (Number.isFinite(raw) && raw > 0) return raw;
 
-  if (!code) {
-    const matched = message.match(/3036|3040|5035|5016|3006|3007|3008/);
-    if (matched) code = Number(matched[0]);
-  }
+  const message = String(err?.message ?? '');
+  // Workers AI 用 4 位码；REST / 账号级还有 5 位码（如 10021），也可能写成 `... [10021]` 后缀。
+  const matched =
+    message.match(/^\s*(\d{4,5}):/) ||
+    message.match(/[A-Za-z]+Error:\s*(\d{4,5})\b/) ||
+    message.match(/\[(\d{5})\]/);
+  return matched ? Number(matched[1]) : 0;
+}
+
+async function mapAIError(env, err, model, cfg) {
+  const code = aiErrorCode(err);
   const status = Number(err?.status ?? err?.httpStatus ?? 0);
+  // 报文要点名真正失败的那个模型和它对应的变量，否则用户会去改错的那一行。
+  const varName = model && model === cfg.model ? 'MODEL' : 'FALLBACK_MODEL';
 
   switch (code) {
     case 3036:
       await markQuotaExhausted(env);
+      // 账号级配额，换模型也一样耗尽，不做兜底。
       return new AppError(429, 'Daily free Neurons quota exhausted; resets at 00:00 UTC');
     case 3040:
-      return new AppError(429, 'Capacity temporarily exceeded, please retry later');
+      return new AppError(429, 'Capacity temporarily exceeded, please retry later', {
+        retryable: true,
+      });
     case 5035:
-      return new AppError(403, 'Model requires Workers Paid plan');
+      return new AppError(403, 'Model requires Workers Paid plan', { switchModel: true });
     case 5016:
-      return new AppError(403, 'Please accept the model terms in the Cloudflare dashboard');
+      return new AppError(403, 'Please accept the model terms in the Cloudflare dashboard', {
+        switchModel: true,
+      });
+    case 5028:
+      return new AppError(
+        410,
+        `Model ${model || cfg.model} was deprecated by Workers AI; set ${varName} to a current model`,
+        { switchModel: true },
+      );
     case 3006:
       return new AppError(413, 'Request too large for the model');
     case 3007:
     case 3008:
-      return new AppError(504, 'Translation timed out');
+      // 超时本身就很慢，同一模型再等一次只会把响应时间翻倍，直接换兜底。
+      return new AppError(504, 'Translation timed out', { switchModel: true });
     default:
       if (status === 429) {
-        return new AppError(429, 'Rate limited by Workers AI, please retry later');
+        // 按模型计的限流：换兜底模型可能就走通了，同一模型不必再试。
+        return new AppError(429, 'Rate limited by Workers AI, please retry later', {
+          switchModel: true,
+        });
       }
-      return new AppError(503, 'Translation failed');
+      // 未收录的上游错误码：保留码值方便定位，但不回显上游原文。
+      return code
+        ? new AppError(503, `Translation failed (Workers AI error ${code})`, { retryable: true })
+        : new AppError(503, 'Translation failed', { retryable: true });
   }
 }
 

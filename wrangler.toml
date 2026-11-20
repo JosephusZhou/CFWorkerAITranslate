@@ -16,9 +16,21 @@ binding = "AI"
 # Workers AI 没有本地模拟，显式声明走远端；本地 dev 与线上行为一致，也避免 wrangler 的告警。
 remote = true
 
+# 构建标识（git short SHA）由部署时注入，不要写死在这里——写死了就等于永远是旧版本。
+# 交互式部署（npm run deploy:interactive）会自动注入；手动部署：
+#   npx wrangler deploy --var BUILD:$(git rev-parse --short HEAD)
+# PowerShell 没有 $() 这种写法：先单独执行 git rev-parse --short HEAD 取值，
+# 再 npx wrangler deploy --var BUILD:<那个值>。
+# 没注入也完全能部署，只是 GET / 的 build 字段会是 null。
+
 [vars]
-# 默认模型：Qwen3-30B-A3B（免费额度内，多语言较强）
-MODEL = "@cf/qwen/qwen3-30b-a3b-fp8"
+# 主模型：Mistral Small 3.1 24B（实测 1.7~3.3 秒，无思考输出，多语言质量好）
+MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct"
+
+# 兜底模型：主模型上游报错/被停用/容量不足时自动改用它。设为 "" 表示不要兜底。
+# 注意：Workers AI 会定期停用旧模型（被停用的模型返回 410/5028）。
+# 换模型前先用 `npx wrangler ai models list` 确认还在册。
+FALLBACK_MODEL = "@cf/ibm-granite/granite-4.0-h-micro"
 
 # 单次请求（单条或批量合计）允许的最大 UTF-16 字符数，对齐 DLX 的 1500
 MAX_TOTAL_CHARS = "1500"
@@ -31,6 +43,8 @@ MAX_OUTPUT_TOKENS = "4096"
 TEMPERATURE = "0.1"
 # 批量翻译时同时发起的 AI 调用数
 CONCURRENCY = "2"
+# 单条请求时每个模型最多调用几次（批量固定 1 次，避免重试×条数）
+ATTEMPTS_PER_MODEL = "2"
 # KV 缓存 TTL（秒）；未绑定 CACHE 时缓存与配额熔断自动跳过
 CACHE_TTL = "86400"
 
